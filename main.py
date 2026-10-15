@@ -1,7 +1,11 @@
 
 import argparse
+import json
+import os
 import re
 import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from pathlib import Path
 
 import pymupdf
@@ -12,12 +16,35 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 RELEVANCE_THRESHOLD = 0.10
 SENTENCE_RELEVANCE_THRESHOLD = 0.08
+DEFAULT_LLM_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
+MAX_CONTEXT_CHUNKS = 5
 EXTRA_STOP_WORDS = {
     "work",
     "works",
     "working",
 }
 STOP_WORDS = sorted(ENGLISH_STOP_WORDS.union(EXTRA_STOP_WORDS))
+
+
+def load_dotenv(env_path=None):
+    """Load simple KEY=VALUE entries from .env without overriding the shell."""
+    env_path = Path(env_path) if env_path else Path(__file__).with_name(".env")
+    if not env_path.is_file():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or key in os.environ:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
 
 
 def is_reference_page(text):
@@ -80,8 +107,8 @@ def extract_pages(pdf_path):
     return pages
 
 
-def search_pdf(pdf_path, query):
-    """Find the page most similar to the query."""
+def search_pdf(pdf_path, query, max_chunks=MAX_CONTEXT_CHUNKS):
+    """Retrieve the most relevant text chunks from a PDF."""
     pages = extract_pages(pdf_path)
 
     # Ignore blank and table-of-contents style pages.
@@ -114,67 +141,99 @@ def search_pdf(pdf_path, query):
         query_vector, page_vectors
     ).flatten()
 
-    best_index = scores.argmax()
-    best_page = nonempty_pages[best_index]
-    best_score = float(scores[best_index])
-
-    if best_score < RELEVANCE_THRESHOLD:
-        return {
-            "page_number": None,
-            "similarity": best_score,
-            "text": None
-        }
-
-    # Find relevant sentences on the best page.
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
-        best_page["text"]
-    )
-    sentences = [s.strip() for s in sentences if s.strip()]
-
-    relevant_text = best_page["text"]
-
-    if sentences:
+    # Rank passages made from each page. Overlapping windows preserve context
+    # while avoiding sending an entire book page to the language model.
+    chunks = []
+    for page in nonempty_pages:
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", page["text"])
+            if sentence.strip()
+        ]
         unique_sentences = []
         seen = set()
-
         for sentence in sentences:
             normalized = normalize_for_search(sentence)
+            if normalized not in seen:
+                seen.add(normalized)
+                unique_sentences.append(sentence)
 
-            if normalized in seen:
-                continue
-
-            seen.add(normalized)
-            unique_sentences.append(sentence)
-
+        if not unique_sentences:
+            continue
         sentence_vectors = vectorizer.transform(unique_sentences)
-        sentence_scores = cosine_similarity(
-            query_vector, sentence_vectors
-        ).flatten()
+        sentence_scores = cosine_similarity(query_vector, sentence_vectors).flatten()
+        # Group neighboring sentences into short coherent context passages.
+        for start in range(0, len(unique_sentences), 3):
+            passage = unique_sentences[start:start + 3]
+            passage_score = float(sentence_scores[start:start + 3].max())
+            if passage_score >= SENTENCE_RELEVANCE_THRESHOLD:
+                chunks.append({
+                    "page_number": page["page_number"],
+                    "similarity": passage_score,
+                    "text": " ".join(passage),
+                })
 
-        ranked_indices = sentence_scores.argsort()[::-1]
-        selected = []
+    chunks.sort(key=lambda chunk: chunk["similarity"], reverse=True)
+    selected = chunks[:max_chunks]
+    if not selected or selected[0]["similarity"] < RELEVANCE_THRESHOLD:
+        return {"chunks": [], "similarity": float(scores.max()) if len(scores) else 0.0}
+    return {"chunks": selected, "similarity": selected[0]["similarity"]}
 
-        for index in ranked_indices:
-            if sentence_scores[index] < SENTENCE_RELEVANCE_THRESHOLD:
-                break
 
-            selected.append(unique_sentences[index])
+def build_augmented_prompt(query, chunks):
+    """Build the grounded prompt sent to the language model."""
+    context = "\n\n".join(
+        f"[Chunk {index} | PDF page {chunk['page_number']}]\n{chunk['text']}"
+        for index, chunk in enumerate(chunks, start=1)
+    )
+    return (
+        "Answer the user's question using the context below. If the context "
+        "does not contain the answer, say that you could not find the answer "
+        "in the PDF. Do not invent facts. Cite supporting pages as [page N].\n\n"
+        f"Context:\n{context}\n\nQuestion: {query}"
+    )
 
-            if len(selected) == 3:
-                break
 
-        if selected:
-            relevant_text = " ".join(selected)
+def generate_response(prompt, api_key=None, endpoint=None, model=None, timeout=60):
+    """Call an OpenAI-compatible chat completions endpoint."""
+    api_key = api_key or os.environ.get("OPENAI_API_KEY")
+    endpoint = endpoint or os.environ.get("OPENAI_BASE_URL", DEFAULT_LLM_ENDPOINT)
+    model = model or os.environ.get("OPENAI_MODEL", DEFAULT_LLM_MODEL)
+    if not api_key:
+        raise ValueError(
+            "Missing LLM API key. Set OPENAI_API_KEY to use generation."
+        )
 
-    return {
-        "page_number": best_page["page_number"],
-        "similarity": best_score,
-        "text": relevant_text
-    }
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"LLM request failed ({error.code}): {details}") from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError(f"Could not reach the LLM endpoint: {error}") from error
+    try:
+        return body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise RuntimeError("LLM endpoint returned an unexpected response.") from error
 
 
 def main():
+    load_dotenv()
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -182,7 +241,7 @@ def main():
         pass
 
     parser = argparse.ArgumentParser(
-        description="Find the most relevant page in a PDF."
+        description="Ask questions about a PDF using retrieval-augmented generation."
     )
 
     parser.add_argument("pdf", help="Path to the PDF file")
@@ -211,19 +270,18 @@ def main():
     try:
         result = search_pdf(pdf_path, query)
 
-        print("\n========== PDF SEARCH RESULT ==========")
+        print("\n========== PDF RAG RESPONSE ==========")
         print(f"Query: {query}")
-        print(f"Similarity score: {result['similarity']:.4f}")
-
-        if result["page_number"] is None:
+        if not result["chunks"]:
             print(
-                "\nNo confident match found. Try a more specific query or "
-                "check whether the PDF covers this topic."
+                "\nNo relevant context found in the PDF, so no LLM request was made."
             )
         else:
-            print(f"Page number: {result['page_number']}")
-            print("\nRelevant text:")
-            print(result["text"])
+            prompt = build_augmented_prompt(query, result["chunks"])
+            print("\n========== AUGMENTED PROMPT ==========")
+            print(prompt)
+            print("\n========== GENERATED RESPONSE ==========")
+            print(generate_response(prompt))
 
         print("=======================================")
 

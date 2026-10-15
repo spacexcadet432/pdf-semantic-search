@@ -1,11 +1,13 @@
 import subprocess
 import sys
+import os
 import unittest
 from pathlib import Path
 
 import pymupdf
 
 from main import search_pdf
+from main import build_augmented_prompt, load_dotenv
 
 
 ROOT = Path(__file__).parent
@@ -19,12 +21,10 @@ class PdfSearchTests(unittest.TestCase):
             cls.page_count = len(pdf)
 
     def assert_valid_result(self, result, expected_terms):
-        self.assertIsNotNone(result["page_number"])
-        self.assertGreaterEqual(result["page_number"], 1)
-        self.assertLessEqual(result["page_number"], self.page_count)
+        self.assertTrue(result["chunks"])
         self.assertGreaterEqual(result["similarity"], 0.10)
 
-        text = result["text"].lower()
+        text = " ".join(chunk["text"] for chunk in result["chunks"]).lower()
         for term in expected_terms:
             self.assertIn(term, text)
 
@@ -34,7 +34,7 @@ class PdfSearchTests(unittest.TestCase):
         self.assert_valid_result(result, ["function", "python"])
         self.assertNotIn(
             "i sleep all night and i work all day",
-            result["text"].lower()
+            " ".join(chunk["text"] for chunk in result["chunks"]).lower()
         )
 
     def test_finds_recursion(self):
@@ -46,7 +46,10 @@ class PdfSearchTests(unittest.TestCase):
         result = search_pdf(PDF_PATH, "What is recursion?")
 
         self.assert_valid_result(result, ["recursion"])
-        self.assertNotIn(". . .", result["text"])
+        self.assertNotIn(
+            ". . .",
+            " ".join(chunk["text"] for chunk in result["chunks"]),
+        )
 
     def test_finds_lists(self):
         result = search_pdf(PDF_PATH, "How do Python lists work?")
@@ -56,8 +59,35 @@ class PdfSearchTests(unittest.TestCase):
     def test_unrelated_query_has_no_confident_match(self):
         result = search_pdf(PDF_PATH, "How do I bake sourdough bread?")
 
-        self.assertIsNone(result["page_number"])
-        self.assertIsNone(result["text"])
+        self.assertEqual(result["chunks"], [])
+
+    def test_augmented_prompt_contains_question_context_and_citations(self):
+        prompt = build_augmented_prompt("What is recursion?", [{
+            "page_number": 12,
+            "text": "A function can call itself.",
+        }])
+        self.assertIn("What is recursion?", prompt)
+        self.assertIn("PDF page 12", prompt)
+        self.assertIn("A function can call itself.", prompt)
+        self.assertIn("say that you could not find", prompt)
+
+    def test_load_dotenv_reads_values_without_overriding_existing_environment(self):
+        env_path = ROOT / ".test-rag.env"
+        env_path.write_text(
+            '# configuration\nTEST_RAG_ENV="loaded value"\n'
+            'TEST_RAG_EXISTING=from-file\nINVALID_LINE\n',
+            encoding="utf-8",
+        )
+        os.environ.pop("TEST_RAG_ENV", None)
+        os.environ["TEST_RAG_EXISTING"] = "from-shell"
+        try:
+            load_dotenv(env_path)
+            self.assertEqual(os.environ["TEST_RAG_ENV"], "loaded value")
+            self.assertEqual(os.environ["TEST_RAG_EXISTING"], "from-shell")
+        finally:
+            env_path.unlink(missing_ok=True)
+            os.environ.pop("TEST_RAG_ENV", None)
+            os.environ.pop("TEST_RAG_EXISTING", None)
 
     def test_cli_reports_missing_file(self):
         completed = subprocess.run(
